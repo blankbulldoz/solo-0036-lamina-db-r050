@@ -3,13 +3,13 @@
 import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
 WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics']
 class Session:
- def __init__(self,binary,root,restore=None):
-  self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None
+ def __init__(self,binary,root,restore=None,args=()):
+  self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None;self.args=list(args)
  def start(self):
   with socket.socket() as sock:
    sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
   self.url=f'http://127.0.0.1:{port}/v1/lamina'
-  args=[self.binary,'-data',str(self.root),'-listen',f'127.0.0.1:{port}']
+  args=[self.binary,'-data',str(self.root),'-listen',f'127.0.0.1:{port}',*self.args]
   if self.restore:args+=['-restore',str(self.restore)];self.restore=None
   self.log=tempfile.TemporaryFile();self.process=subprocess.Popen(args,stdout=self.log,stderr=self.log)
   deadline=time.monotonic()+8
@@ -107,14 +107,60 @@ def walkthrough(name,binary):
     require((one['amplitude']==202)==any(r['sample']==8 for r in rows),'conflicting commit partially published')
     s.commit(a,404);s.commit(b,404);observations={'results':results,'rows':rows}
    elif name=='restart':
-    before=s.query()['rows'];s.stop()
+    before=s.query()['rows'];committed=s.stats()['sequence'];s.stop()
     with (s.root/'journal.lmw').open('ab') as f:f.write(b'\x00\x00\x00')
-    s.start();require(s.query()['rows']==before,'tail recovery changed committed data');require(s.stats()['recovered_tail_bytes']==3,'tail recovery not reported')
-    s.stop();broken=temp/'broken';shutil.copytree(s.root,broken)
+    s.args=['-recovery-evidence','bounded','-recovery-evidence-limit','4']
+    s.start();require(s.query()['rows']==before,'tail recovery changed committed data');stats=s.stats()
+    require(stats['recovered_tail_bytes']==3,'tail recovery not reported')
+    report=s.call('GET','/recovery');health=s.call('GET','/health')
+    require(report['state']=='ready' and report['query_ready'] and health['query_ready'],'readiness not published after recovery')
+    require(report['verified_through']==committed and report['sequence']==committed,'verified range does not match proven commits')
+    require(report['tail']['present'] and report['tail']['bytes']==3 and report['tail']['next_sequence']==committed+1,'torn tail misreported')
+    require(report['tail']['sha256'] and (s.root/report['tail']['preserved']).read_bytes()==b'\x00\x00\x00','torn source not preserved')
+    require(report['evidence']=='bounded' and report['evidence_limit']==4,'evidence level not applied')
+    require(0<len(report['sample'])<=4 and report['sample_total']==report['verified_records'],'bounded evidence not bounded')
+    require(all(report['sample'][i]['offset']<report['sample'][i+1]['offset'] for i in range(len(report['sample'])-1)),'evidence offsets not ordered')
+    page=s.call('GET',f'/changes?after={committed}')
+    require(page['head']==report['verified_through']==health['verified_through'] and page['cursor']==committed and not page['records'],'change head disagrees with verified range')
+    s.call('GET',f'/changes?after={committed+1}',status=400)
+    tx=s.begin();s.put(tx,tuple_(8));after=s.commit(tx)['sequence'];require(after==committed+1,'post-recovery commit did not continue verified range')
+    first_tail=report['tail']
+    s.stop();s.start()
+    second=s.call('GET','/recovery')
+    require(second['state']=='ready' and not second['tail']['present'],'truncation was not durable; tail reported twice')
+    require(second['verified_through']==after and (s.root/first_tail['preserved']).exists(),'second restart lost the verified range or preserved tail')
+    s.stop()
+    # Complete-frame corruption must fail closed without touching the source journal.
+    broken=temp/'broken';broken.mkdir()
+    shutil.copy2(s.root/'journal.lmw',broken/'journal.lmw')
+    if (s.root/'checkpoint.lmi').exists():shutil.copy2(s.root/'checkpoint.lmi',broken/'checkpoint.lmi')
     data=bytearray((broken/'journal.lmw').read_bytes());data[-1]^=1;(broken/'journal.lmw').write_bytes(data)
-    result=subprocess.run([str(binary),'-data',str(broken),'-listen','127.0.0.1:0'],capture_output=True,text=True,timeout=5)
+    intact=(broken/'journal.lmw').read_bytes();report_path=temp/'failed.json'
+    result=subprocess.run([str(binary),'-data',str(broken),'-listen','127.0.0.1:0','-recovery-evidence','summary','-recovery-report',str(report_path)],capture_output=True,text=True,timeout=5)
     require(result.returncode!=0 and 'checksum' in result.stderr,'full frame corruption accepted')
-    observations={'tail_bytes':3,'corruption':'rejected'}
+    failed=json.loads(report_path.read_text())
+    require(failed['state']=='failed' and not failed['query_ready'],'corruption published a ready state')
+    require(failed['corruption']['class']=='checksum' and failed['corruption']['source_preserved'],'corruption class or source not reported')
+    require(failed['verified_through']==after-1 and failed['corruption']['expected_sequence']==after,'corruption boundary misreported')
+    require(failed['tail']['present']==False,'complete corruption reported as a torn tail')
+    require((broken/'journal.lmw').read_bytes()==intact,'corruption path truncated the source journal')
+    require(not (broken/'recovery').exists() or not list((broken/'recovery').glob('torn-*')),'corruption bytes quarantined as a tail')
+    # Minimal evidence keeps the boundary facts and header digest but no per-record sample.
+    quiet=temp/'quiet';quiet.mkdir()
+    shutil.copy2(s.root/'journal.lmw',quiet/'journal.lmw')
+    if (s.root/'checkpoint.lmi').exists():shutil.copy2(s.root/'checkpoint.lmi',quiet/'checkpoint.lmi')
+    probe=subprocess.Popen([str(binary),'-data',str(quiet),'-listen','127.0.0.1:0','-recovery-evidence','minimal','-recovery-report',str(temp/'minimal.json')],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    try:
+     deadline=time.monotonic()+5
+     while time.monotonic()<deadline and not (temp/'minimal.json').exists():time.sleep(.03)
+     require((temp/'minimal.json').exists(),'minimal recovery report not written')
+     minimal=json.loads((temp/'minimal.json').read_text())
+     require(minimal['evidence']=='minimal' and 'sample' not in minimal and 'kinds' not in minimal,'minimal evidence retained detail')
+     require(minimal['verified_through']==after and not minimal['tail']['present'],'minimal evidence lost the verified boundary')
+    finally:probe.terminate();probe.wait(timeout=12)
+    invalid=subprocess.run([str(binary),'-data',str(temp/'noise'),'-listen','127.0.0.1:0','-recovery-evidence','verbose'],capture_output=True,text=True,timeout=5)
+    require(invalid.returncode!=0 and 'recovery evidence' in invalid.stderr,'unknown evidence level accepted')
+    observations={'verified_through':committed,'tail':report['tail'],'evidence':report['evidence'],'sample':len(report['sample']),'post_tail_commit':after,'minimal_sample':minimal.get('sample','omitted'),'failure':{'class':failed['corruption']['class'],'verified_through':failed['verified_through'],'journal_untouched':True}}
    elif name=='checkpoint':
     at=s.call('POST','/checkpoint')['sequence'];tx=s.begin();s.put(tx,tuple_(8));s.commit(tx)
     before=s.query()['rows'];s.stop();s.start();require(s.query()['rows']==before,'checkpoint plus suffix recovery failed')

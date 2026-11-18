@@ -56,7 +56,7 @@ func Restore(dir string, data []byte) error {
 			os.Remove(dir)
 		}
 	}()
-	w, err := journal.Open(dir, image.Sequence)
+	w, err := journal.Open(dir, image.Sequence, journal.Options{})
 	if err != nil {
 		return err
 	}

@@ -46,6 +46,9 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, 200, out)
 }
+func (s *Server) recovery(w http.ResponseWriter, r *http.Request) {
+	write(w, 200, s.db.RecoveryReport())
+}
 func (s *Server) changes(w http.ResponseWriter, r *http.Request) {
 	after := uint64(0)
 	limit := 100
